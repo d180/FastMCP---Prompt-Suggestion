@@ -1,0 +1,8 @@
+{
+  "name": "prompt-suggestion",
+  "version": "1.0.0",
+  "description": "Suggests better prompts when a user dislikes an LLM answer.",
+  "entrypoint": "server.py",
+  "homepage": "https://github.com/yourrepo",
+  "license": "MIT"
+}

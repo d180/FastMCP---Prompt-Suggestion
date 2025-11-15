@@ -1,0 +1,9 @@
+entrypoint: python3 server.py
+
+env:
+  - GEMINI_API_KEY
+
+metadata:
+  name: "Prompt Suggestion MCP"
+  description: "Analyzes disliked LLM responses and suggests improved follow-up prompts."
+  version: "1.0.0"
