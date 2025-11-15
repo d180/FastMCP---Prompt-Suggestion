@@ -92,8 +92,8 @@ CRITICAL RULES FOR "suggested_prompt":
 You will output STRICT JSON with these keys:
 - "summary": short explanation of what went wrong with the assistant's last answer.
 - "root_causes": array of 1–4 bullet-style reasons (strings) explaining the failure.
-- "suggested_prompt": the single improved, self-contained FIRST-PERSON prompt the user should send next.
-- "alternatives": array of 0–3 alternative prompts, each also directly sendable, self-contained, and written in first-person.
+- "suggested_prompt": the single BEST improved, self-contained FIRST-PERSON prompt the user should send next.
+- "alternatives": ALWAYS an empty array [] (do NOT put any prompts here).
 - "confidence": number between 0 and 1 (your confidence that the suggested_prompt will work well).
 
 Full conversation:
@@ -191,7 +191,7 @@ def analyze_dislike(
     summary = data.get("summary", "").strip()
     suggested_prompt = data.get("suggested_prompt", "").strip()
     root_causes = data.get("root_causes") or []
-    alternatives = data.get("alternatives") or []
+    # Ignore whatever the model put in `alternatives` – we want a single best prompt only
     confidence_raw = data.get("confidence", 0.8)
 
     try:
@@ -199,7 +199,6 @@ def analyze_dislike(
     except Exception:
         confidence = 0.8
 
-    # Clamp confidence to [0, 1]
     if confidence < 0:
         confidence = 0.0
     if confidence > 1:
@@ -209,10 +208,12 @@ def analyze_dislike(
         "summary": summary,
         "root_causes": list(root_causes),
         "suggested_prompt": suggested_prompt,
-        "alternatives": list(alternatives),
+        # 🔒 Force alternatives to always be an empty list
+        "alternatives": [],
         "confidence": confidence,
     }
     return result
+
 
 
 # ---------- Local dev entrypoint (FastMCP Cloud ignores this) ----------
