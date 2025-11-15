@@ -1,64 +1,57 @@
-from __future__ import annotations
-
-import json
 import os
-from typing import Any, Dict, List, Optional
+import json
+from typing import List, Literal, Optional
 
-from fastmcp import FastMCP
+from fastmcp import FastMCP, tool
 from google import genai
-# ---------- Config ----------
+from google.genai import types
 
-GEMINI_MODEL = "gemini-2.0-flash"  # adjust if you prefer a different model name
+# ---------- Load API key ----------
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError(
+        "GEMINI_API_KEY is not set. "
+        "Configure it in FastMCP Cloud under Environment Variables."
+    )
 
+client = genai.Client(api_key=GEMINI_API_KEY)
 
-def _get_gemini_client() -> genai.Client:
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set in environment variables")
-    return genai.Client(api_key=api_key)
-
-
-# ---------- MCP server ----------
-
-# You can list dependencies here so `fastmcp install` knows what to pull in
+# ---------- FastMCP server ----------
 mcp = FastMCP(
-    name="dislike-coach",
-    dependencies=["google-genai"],
+    name="prompt-suggestion",
+    version="1.0.0",
+    description="Suggests improved follow-up prompts when a user dislikes an LLM answer.",
 )
 
+Role = Literal["user", "assistant", "system", "tool"]
 
-# ---------- Helper: build the user-facing analysis prompt ----------
 
 def build_user_prompt(
-    messages: List[Dict[str, str]],
+    messages: List[dict],
     user_comment: Optional[str] = None,
     task_hint: Optional[str] = None,
+    window_size: int = 8,
 ) -> str:
     """
-    Build the prompt text for Gemini, matching the TypeScript buildUserPrompt behavior.
+    Build the big system-style prompt we send to Gemini.
+    Truncates conversation to last `window_size` messages.
     """
+    if len(messages) > window_size:
+        messages = messages[-window_size:]
 
-    # 🔥 Recommended truncation: last 4 messages = 2 turns
-    truncated = messages[-4:]
+    convo = "\n".join(
+        f"{m.get('role','user').upper()}: {m.get('content','')}" for m in messages
+    )
 
-    # Recreate "ROLE: content" format
-    convo_lines: List[str] = []
-    for m in truncated:
-        role = (m.get("role") or "user").upper()
-        content = (m.get("content") or "").strip()
-        if not content:
-            continue
-        convo_lines.append(f"{role}: {content}")
-    convo = "\n".join(convo_lines)
+    last_user = next(
+        (
+            m.get("content", "")
+            for m in reversed(messages)
+            if m.get("role") == "user"
+        ),
+        "(unknown last user message)",
+    )
 
-    # Last user message
-    last_user = "(unknown last user message)"
-    for m in reversed(truncated):
-        if m.get("role") == "user" and m.get("content"):
-            last_user = str(m["content"]).strip()
-            break
-
-    # Full rewritten prompt instructions (same as TS)
     return f"""
 You are a PROMPT REWRITER for LLM chats.
 
@@ -74,7 +67,7 @@ Your job is to:
 3. Produce a SINGLE, SELF-CONTAINED prompt that the user can send to the SAME assistant to get a much better answer.
 
 CRITICAL RULES FOR "suggested_prompt":
-- It MUST be written in the FIRST-PERSON perspective, as if the user is directly talking to the assistant.
+- It MUST be written in the FIRST-PERSON perspective, as if I am directly talking to you (the assistant).
   - Use "you" to refer to the assistant.
   - Use "I", "me", and "my" to refer to the user.
 - Avoid generic phrases like "the user" or "users" when describing benefits.
@@ -97,11 +90,11 @@ Examples of GOOD suggested_prompt (STYLE TO FOLLOW):
 - "Explain how neural networks work to me in beginner-friendly language, using a clear analogy and a short example."
 
 You will output STRICT JSON with these keys:
-- "summary"
-- "root_causes"
-- "suggested_prompt"
-- "alternatives"
-- "confidence"
+- "summary": short explanation of what went wrong with the assistant's last answer.
+- "root_causes": array of 1–4 bullet-style reasons (strings) explaining the failure.
+- "suggested_prompt": the single improved, self-contained FIRST-PERSON prompt the user should send next.
+- "alternatives": array of 0–3 alternative prompts, each also directly sendable, self-contained, and written in first-person.
+- "confidence": number between 0 and 1 (your confidence that the suggested_prompt will work well).
 
 Full conversation:
 {convo}
@@ -109,142 +102,100 @@ Full conversation:
 Last user message (for focus):
 {last_user}
 
-User comment:
+User comment (may be empty):
 {user_comment or "(none)"}
 
-Task hint:
+Task hint (may be empty):
 {task_hint or "(none)"}
 """.strip()
 
 
-# ---------- Helper: JSON-safe parsing & clamping ----------
-
-def parse_and_normalize_output(raw_text: str) -> Dict[str, Any]:
+def _parse_gemini_json(raw_text: str) -> dict:
     """
-    Try to parse model output as JSON and normalize fields so that:
-    - root_causes is a list of strings
-    - alternatives is a list of strings
-    - confidence is in [0, 1]
+    Gemini sometimes wraps JSON in text or ```json fences.
+    Try to robustly extract the JSON object.
     """
     text = raw_text.strip()
 
-    # Try to strip accidental ```json ... ``` fences if present
+    # Strip ``` fences if present
     if text.startswith("```"):
-        # crude fence removal
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:].strip()
+        # find first '{' and last '}'
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            text = text[start : end + 1]
 
     try:
         data = json.loads(text)
-    except json.JSONDecodeError:
-        # Fallback: wrap in a safe "failed" result
-        return {
-            "summary": "Model output was not valid JSON.",
-            "root_causes": [
-                "The coach model did not follow the strict JSON-only instructions."
-            ],
-            "suggested_prompt": "Please help me debug why my last LLM answer was bad.",
-            "alternatives": [],
-            "confidence": 0.3,
-        }
+    except Exception:
+        # fallback: try to locate first JSON-like block
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            snippet = text[start : end + 1]
+            data = json.loads(snippet)
+        else:
+            raise ValueError("Model did not return valid JSON")
 
-    # Ensure types / defaults
-    summary = str(data.get("summary", "") or "").strip()
-    root_causes_raw = data.get("root_causes") or []
-    alternatives_raw = data.get("alternatives") or []
-    suggested_prompt = str(data.get("suggested_prompt", "") or "").strip()
-    confidence_raw = data.get("confidence", 0.5)
+    # Normalize output shape + defaults
+    summary = data.get("summary", "").strip()
+    suggested = data.get("suggested_prompt", "").strip()
+    root_causes = data.get("root_causes") or []
+    alternatives = data.get("alternatives") or []
+    confidence = data.get("confidence", 0.7)
 
-    # Normalize lists
-    root_causes: List[str] = []
-    if isinstance(root_causes_raw, list):
-        root_causes = [str(x) for x in root_causes_raw if str(x).strip()]
-    else:
-        root_causes = [str(root_causes_raw)] if root_causes_raw else []
-
-    alternatives: List[str] = []
-    if isinstance(alternatives_raw, list):
-        alternatives = [str(x) for x in alternatives_raw if str(x).strip()]
-    else:
-        alternatives = [str(alternatives_raw)] if alternatives_raw else []
-
-    # Confidence clamp
+    # clamp confidence
     try:
-        conf_val = float(confidence_raw)
-    except (TypeError, ValueError):
-        conf_val = 0.5
-    if conf_val < 0:
-        conf_val = 0.0
-    if conf_val > 1:
-        conf_val = 1.0
-
-    # If model forgot a good suggested_prompt, make a fallback
-    if not suggested_prompt and summary:
-        suggested_prompt = f"Help me with the following: {summary}"
-
-    if not suggested_prompt:
-        suggested_prompt = (
-            "Help me refine my question so I can get a better answer than last time."
-        )
+        c = float(confidence)
+    except Exception:
+        c = 0.7
+    c = max(0.0, min(1.0, c))
 
     return {
-        "summary": summary or "Unknown user goal.",
+        "summary": summary,
         "root_causes": root_causes,
-        "suggested_prompt": suggested_prompt,
+        "suggested_prompt": suggested,
         "alternatives": alternatives,
-        "confidence": conf_val,
+        "confidence": c,
     }
 
 
-# ---------- Tool: analyze_dislike ----------
-
-@mcp.tool()
+@tool(
+    mcp,
+    name="analyze_dislike",
+    description="Given a short conversation and a disliked answer, suggest a better follow-up prompt.",
+)
 def analyze_dislike(
-    messages: List[Dict[str, str]],
+    messages: List[dict],
     user_comment: Optional[str] = None,
     task_hint: Optional[str] = None,
-) -> Dict[str, Any]:
+) -> dict:
     """
-    Analyze a disliked LLM response and suggest a better follow-up prompt.
-
-    Args:
-        messages: Recent conversation turns as a list of { "role": "...", "content": "..." }.
-                  Roles are typically "user" or "assistant".
-        user_comment: Optional free-text explanation from the user about why they disliked
-                      the answer.
-        task_hint: Optional short hint about the task domain, e.g. "coding", "data analysis",
-                   "UI design", "math homework", etc.
-
-    Returns:
-        A JSON object with keys:
-          - summary: string
-          - root_causes: list[string]
-          - suggested_prompt: string  (first-person phrasing)
-          - alternatives: list[string]
-          - confidence: float in [0, 1]
+    This is the core tool: same semantics as your Chrome extension.
+    - `messages`: small conversation window [{role, content}, ...]
+    - `user_comment`: optional explanation from the user
+    - `task_hint`: optional domain hint (e.g., 'frontend', 'docker', etc.)
     """
-    client = _get_gemini_client()
 
-    user_prompt = build_user_prompt(
-        messages=messages,
-        user_comment=user_comment,
-        task_hint=task_hint,
-    )
+    # Build the big instruction prompt
+    prompt = build_user_prompt(messages, user_comment, task_hint)
 
-    # We keep it single-prompt; Gemini will generate the JSON directly.
+    # Call Gemini 2.5 Flash
     resp = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=user_prompt,
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.4,
+            max_output_tokens=512,
+            response_mime_type="text/plain",
+        ),
     )
 
-    # The python SDK exposes .text with concatenated text parts
-    raw_text = getattr(resp, "text", "") or ""
-
-    result = parse_and_normalize_output(raw_text)
-    return result
+    raw_text = resp.text or ""
+    data = _parse_gemini_json(raw_text)
+    return data
 
 
 if __name__ == "__main__":
-    # Run as a stdio MCP server (FastMCP handles the protocol)
+    # This is what FastMCP calls during preflight
     mcp.run()

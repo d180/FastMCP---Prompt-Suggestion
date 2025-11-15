@@ -1,3 +1,4 @@
-fastmcp==2.0.0
-google-genai>=1.0.0
+fastmcp==2.12.3
+google-genai>=0.0.1
 python-dotenv>=1.0.0
+typer>=0.12.0
