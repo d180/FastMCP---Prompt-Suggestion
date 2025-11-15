@@ -114,5 +114,5 @@ The MCP server always returns:
   "root_causes": ["..."],
   "suggested_prompt": "THE BEST FIRST-PERSON PROMPT",
   "alternatives": ["..."],
-  "confidence": 0.0 - 1.0
+  "confidence": "0.0 - 1.0"
 }
