@@ -118,20 +118,15 @@ def call_llm(system: str, user: str) -> str:
 
     resp = client.models.generate_content(
         model=GEMINI_MODEL,
-        contents=[
-            genai_types.Content(
-                role="user",
-                parts=[genai_types.Part.from_text(prompt)],
-            )
-        ],
+        contents=prompt,  # plain text is fine
         config=genai_types.GenerateContentConfig(
             temperature=0.2,
             max_output_tokens=768,
         ),
     )
 
-    text = (resp.text or "").strip()
-    return text
+    return (resp.text or "").strip()
+
 
 
 def strip_code_fences(text: str) -> str:
