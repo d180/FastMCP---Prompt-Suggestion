@@ -1,54 +1,65 @@
 import os
 import json
-from typing import List, Literal, Optional
+from typing import Literal, TypedDict, List, Optional
 
-from fastmcp import FastMCP, tool
+from fastmcp import FastMCP
 from google import genai
-from google.genai import types
+from google.genai import types as genai_types
 
-# ---------- Load API key ----------
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise RuntimeError(
-        "GEMINI_API_KEY is not set. "
-        "Configure it in FastMCP Cloud under Environment Variables."
-    )
+# ---------- Config ----------
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
 
-# ---------- FastMCP server ----------
-mcp = FastMCP(
-    name="prompt-suggestion",
-    version="1.0.0",
-    description="Suggests improved follow-up prompts when a user dislikes an LLM answer.",
-)
+api_key = os.getenv("GEMINI_API_KEY")
+if not api_key:
+    # In FastMCP Cloud this comes from the dashboard env vars
+    raise RuntimeError("GEMINI_API_KEY is not set")
 
-Role = Literal["user", "assistant", "system", "tool"]
+client = genai.Client(api_key=api_key)
+
+# Our MCP server instance
+mcp = FastMCP(name="PromptSuggestion")
+
+# ---------- Types ----------
+
+class ChatMessage(TypedDict):
+    role: Literal["user", "assistant", "system", "tool"]
+    content: str
+
+
+class AnalyzeResult(TypedDict):
+    summary: str
+    root_causes: List[str]
+    suggested_prompt: str
+    alternatives: List[str]
+    confidence: float
+
+
+# ---------- Helper: truncate & prompt builder ----------
+
+MAX_MESSAGES = 8  # roughly last 4 turns (user+assistant pairs)
+
+
+def truncate_messages(messages: List[ChatMessage]) -> List[ChatMessage]:
+    """Keep only the last N messages."""
+    return messages[-MAX_MESSAGES:]
 
 
 def build_user_prompt(
-    messages: List[dict],
+    messages: List[ChatMessage],
     user_comment: Optional[str] = None,
     task_hint: Optional[str] = None,
-    window_size: int = 8,
 ) -> str:
-    """
-    Build the big system-style prompt we send to Gemini.
-    Truncates conversation to last `window_size` messages.
-    """
-    if len(messages) > window_size:
-        messages = messages[-window_size:]
+    # Same spirit as your TS version
+    trimmed = truncate_messages(messages)
 
     convo = "\n".join(
-        f"{m.get('role','user').upper()}: {m.get('content','')}" for m in messages
+        f"{m['role'].upper()}: {m['content']}"
+        for m in trimmed
     )
 
     last_user = next(
-        (
-            m.get("content", "")
-            for m in reversed(messages)
-            if m.get("role") == "user"
-        ),
+        (m["content"] for m in reversed(trimmed) if m["role"] == "user"),
         "(unknown last user message)",
     )
 
@@ -67,7 +78,7 @@ Your job is to:
 3. Produce a SINGLE, SELF-CONTAINED prompt that the user can send to the SAME assistant to get a much better answer.
 
 CRITICAL RULES FOR "suggested_prompt":
-- It MUST be written in the FIRST-PERSON perspective, as if I am directly talking to you (the assistant).
+- It MUST be written in the FIRST-PERSON perspective, as if the user is directly talking to the assistant.
   - Use "you" to refer to the assistant.
   - Use "I", "me", and "my" to refer to the user.
 - Avoid generic phrases like "the user" or "users" when describing benefits.
@@ -77,17 +88,6 @@ CRITICAL RULES FOR "suggested_prompt":
 - It MUST directly request the desired result (explanation, code, design, plan, etc.).
 - It CAN add clarifying constraints based on context (e.g. "in simple terms", "with 3 concrete UX improvements", "step-by-step").
 - It SHOULD be clear, concise, and specific.
-
-Examples of BAD suggested_prompt (DO NOT WRITE THESE):
-- "Based on the previous discussion, can you..."
-- "Provide HTML/CSS for a login page for the user..."
-- "Explain to the user how Docker works."
-- "Explain how this improves the user's experience."
-
-Examples of GOOD suggested_prompt (STYLE TO FOLLOW):
-- "Explain Kubernetes pods to me in simple terms using a real-world analogy, and give me 3 concrete use cases."
-- "Give me HTML/CSS for a simple login page, and include 3 specific modern UX improvements. Explain how each improvement helps me."
-- "Explain how neural networks work to me in beginner-friendly language, using a clear analogy and a short example."
 
 You will output STRICT JSON with these keys:
 - "summary": short explanation of what went wrong with the assistant's last answer.
@@ -110,92 +110,118 @@ Task hint (may be empty):
 """.strip()
 
 
-def _parse_gemini_json(raw_text: str) -> dict:
-    """
-    Gemini sometimes wraps JSON in text or ```json fences.
-    Try to robustly extract the JSON object.
-    """
-    text = raw_text.strip()
+# ---------- Helper: call Gemini + JSON parsing ----------
 
-    # Strip ``` fences if present
-    if text.startswith("```"):
-        # find first '{' and last '}'
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            text = text[start : end + 1]
+def call_llm(system: str, user: str) -> str:
+    """Call Gemini and return raw text."""
+    prompt = f"System:\n{system}\n\nUser:\n{user}"
 
-    try:
-        data = json.loads(text)
-    except Exception:
-        # fallback: try to locate first JSON-like block
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            snippet = text[start : end + 1]
-            data = json.loads(snippet)
-        else:
-            raise ValueError("Model did not return valid JSON")
-
-    # Normalize output shape + defaults
-    summary = data.get("summary", "").strip()
-    suggested = data.get("suggested_prompt", "").strip()
-    root_causes = data.get("root_causes") or []
-    alternatives = data.get("alternatives") or []
-    confidence = data.get("confidence", 0.7)
-
-    # clamp confidence
-    try:
-        c = float(confidence)
-    except Exception:
-        c = 0.7
-    c = max(0.0, min(1.0, c))
-
-    return {
-        "summary": summary,
-        "root_causes": root_causes,
-        "suggested_prompt": suggested,
-        "alternatives": alternatives,
-        "confidence": c,
-    }
-
-
-@tool(
-    mcp,
-    name="analyze_dislike",
-    description="Given a short conversation and a disliked answer, suggest a better follow-up prompt.",
-)
-def analyze_dislike(
-    messages: List[dict],
-    user_comment: Optional[str] = None,
-    task_hint: Optional[str] = None,
-) -> dict:
-    """
-    This is the core tool: same semantics as your Chrome extension.
-    - `messages`: small conversation window [{role, content}, ...]
-    - `user_comment`: optional explanation from the user
-    - `task_hint`: optional domain hint (e.g., 'frontend', 'docker', etc.)
-    """
-
-    # Build the big instruction prompt
-    prompt = build_user_prompt(messages, user_comment, task_hint)
-
-    # Call Gemini 2.5 Flash
     resp = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.4,
-            max_output_tokens=512,
-            response_mime_type="text/plain",
+        model=GEMINI_MODEL,
+        contents=[
+            genai_types.Content(
+                role="user",
+                parts=[genai_types.Part.from_text(prompt)],
+            )
+        ],
+        config=genai_types.GenerateContentConfig(
+            temperature=0.2,
+            max_output_tokens=768,
         ),
     )
 
-    raw_text = resp.text or ""
-    data = _parse_gemini_json(raw_text)
-    return data
+    text = (resp.text or "").strip()
+    return text
 
+
+def strip_code_fences(text: str) -> str:
+    """Remove ``` or ```json fences if the model wraps the JSON."""
+    t = text.strip()
+    if t.startswith("```"):
+        parts = t.split("```", 2)
+        if len(parts) >= 2:
+            inner = parts[1]
+            if inner.lstrip().startswith("json"):
+                inner = inner.lstrip()[4:].lstrip()
+            return inner.strip()
+    return t
+
+
+def safe_parse_json(text: str) -> dict:
+    cleaned = strip_code_fences(text)
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        # Last resort: try to find outermost braces
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(cleaned[start : end + 1])
+        raise
+
+
+# ---------- MCP Tool ----------
+
+@mcp.tool()
+def analyze_dislike(
+    messages: List[ChatMessage],
+    user_comment: Optional[str] = None,
+    task_hint: Optional[str] = None,
+) -> AnalyzeResult:
+    """
+    Analyze a disliked LLM response and suggest a better follow-up prompt.
+    """
+
+    base_system = (
+        "Return ONLY a JSON object with keys: "
+        "summary, root_causes, suggested_prompt, alternatives, confidence."
+    )
+    strict_system = (
+        "STRICT JSON ONLY. Keys: summary, root_causes, suggested_prompt, "
+        "alternatives, confidence. No extra text."
+    )
+
+    user_prompt = build_user_prompt(messages, user_comment, task_hint)
+
+    # First attempt
+    raw = call_llm(base_system, user_prompt)
+    try:
+        data = safe_parse_json(raw)
+    except Exception:
+        # Retry with stricter instructions
+        raw2 = call_llm(strict_system, user_prompt)
+        data = safe_parse_json(raw2)
+
+    # Build result with sensible defaults
+    summary = data.get("summary", "").strip()
+    suggested_prompt = data.get("suggested_prompt", "").strip()
+    root_causes = data.get("root_causes") or []
+    alternatives = data.get("alternatives") or []
+    confidence_raw = data.get("confidence", 0.8)
+
+    try:
+        confidence = float(confidence_raw)
+    except Exception:
+        confidence = 0.8
+
+    # Clamp confidence to [0, 1]
+    if confidence < 0:
+        confidence = 0.0
+    if confidence > 1:
+        confidence = 1.0
+
+    result: AnalyzeResult = {
+        "summary": summary,
+        "root_causes": list(root_causes),
+        "suggested_prompt": suggested_prompt,
+        "alternatives": list(alternatives),
+        "confidence": confidence,
+    }
+    return result
+
+
+# ---------- Local dev entrypoint (FastMCP Cloud ignores this) ----------
 
 if __name__ == "__main__":
-    # This is what FastMCP calls during preflight
+    # For local testing: `fastmcp run server.py`
     mcp.run()
