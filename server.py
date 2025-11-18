@@ -8,7 +8,7 @@ from google.genai import types as genai_types
 
 # ---------- Config ----------
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
