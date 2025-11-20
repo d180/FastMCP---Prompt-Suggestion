@@ -121,7 +121,7 @@ def call_llm(system: str, user: str) -> str:
         contents=prompt,  # plain text is fine
         config=genai_types.GenerateContentConfig(
             temperature=0.2,
-            max_output_tokens=768,
+            max_output_tokens=8192,  # Changed from 768 to 8192
         ),
     )
 
