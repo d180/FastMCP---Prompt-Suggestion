@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from typing import Literal, TypedDict, List, Optional
 
 from fastmcp import FastMCP
@@ -113,20 +114,46 @@ Task hint (may be empty):
 # ---------- Helper: call Gemini + JSON parsing ----------
 
 def call_llm(system: str, user: str) -> str:
-    """Call Gemini and return raw text."""
+    """Call Gemini with retry logic for rate limits."""
     prompt = f"System:\n{system}\n\nUser:\n{user}"
 
-    resp = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,  # plain text is fine
-        config=genai_types.GenerateContentConfig(
-            temperature=0.2,
-            max_output_tokens=8192,  # Changed from 768 to 8192
-        ),
-    )
-
-    return (resp.text or "").strip()
-
+    max_retries = 3
+    base_delay = 2  # Start with 2 seconds
+    
+    for attempt in range(max_retries):
+        try:
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    temperature=0.2,
+                    max_output_tokens=8192,
+                ),
+            )
+            return (resp.text or "").strip()
+        
+        except Exception as e:
+            error_str = str(e)
+            
+            # Check if it's a rate limit error
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                if attempt < max_retries - 1:
+                    # Exponential backoff: 2s, 4s, 8s
+                    wait_time = base_delay * (2 ** attempt)
+                    print(f"⏳ Rate limited (attempt {attempt + 1}/{max_retries}). Waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # Last attempt failed
+                    raise Exception(
+                        "Rate limit exceeded after retries. This is a temporary issue. "
+                        "Please wait 30 seconds and try again."
+                    )
+            else:
+                # Not a rate limit error, raise immediately
+                raise
+    
+    return ""
 
 
 def strip_code_fences(text: str) -> str:
@@ -183,6 +210,10 @@ def analyze_dislike(
     try:
         data = safe_parse_json(raw)
     except Exception:
+        # Add delay before retry to avoid hitting rate limit again
+        print("⏳ Waiting 3 seconds before retry...")
+        time.sleep(3)
+        
         # Retry with stricter instructions
         raw2 = call_llm(strict_system, user_prompt)
         data = safe_parse_json(raw2)
